@@ -1,5 +1,4 @@
 mod cli;
-mod mqtt;
 mod tui;
 mod utils;
 

@@ -1,4 +1,4 @@
-use crate::mqtt::{Packet, UdpFrame};
+use mqtt::{Packet, UdpFrame};
 use std::borrow::Cow;
 
 /// Format payload for display
@@ -54,8 +54,8 @@ fn format_mqtt_frame(data: &[u8]) -> Option<String> {
             format!("SUBSCRIBE [{}]", topics.join(", "))
         }
         Packet::SubAck(s) => format!("SUBACK {:?}", s.return_codes),
-        Packet::PingReq(_) => "PINGREQ".into(),
-        Packet::PingResp(_) => "PINGRESP".into(),
+        Packet::Ping(_) => "PING".into(),
+        Packet::Pong(_) => "PONG".into(),
         Packet::Disconnect(_) => "DISCONNECT".into(),
     };
 

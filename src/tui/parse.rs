@@ -1,11 +1,11 @@
-use crate::mqtt::{
-    ConnAck, Connect, ConnectReturnCode, Disconnect, Packet, PingReq, PingResp, PubAck, Publish,
+use mqtt::{
+    ConnAck, Connect, ConnectReturnCode, Disconnect, Packet, Ping, Pong, PubAck, Publish,
     QoS, SubAck, SubAckReturnCode, Subscribe, SubscribeFilter, UdpFrame,
 };
 use crate::tui::next_msg_id;
 
 /// Parse MQTT command syntax into a UdpFrame
-pub fn parse_mqtt_command(input: &str) -> crate::mqtt::Result<UdpFrame, String> {
+pub fn parse_mqtt_command(input: &str) -> mqtt::Result<UdpFrame, String> {
     let input = input.trim();
     let (cmd, rest) = input.split_once(' ').unwrap_or((input, ""));
     let rest = rest.trim();
@@ -98,7 +98,7 @@ pub fn parse_mqtt_command(input: &str) -> crate::mqtt::Result<UdpFrame, String> 
             Subscribe::new(filters).into()
         }
 
-        "ping" => PingReq.into(),
+        "ping" => Ping.into(),
         "disconnect" | "disc" => Disconnect.into(),
         "puback" => PubAck.into(),
 
@@ -127,7 +127,7 @@ pub fn parse_mqtt_command(input: &str) -> crate::mqtt::Result<UdpFrame, String> 
 
         "suback" => {
             // suback 0 1 2 or suback fail
-            let codes: crate::mqtt::Result<Vec<_>, _> = rest
+            let codes: mqtt::Result<Vec<_>, _> = rest
                 .split_whitespace()
                 .map(|s| match s {
                     "0" => Ok(SubAckReturnCode::SuccessQoS0),
@@ -140,7 +140,7 @@ pub fn parse_mqtt_command(input: &str) -> crate::mqtt::Result<UdpFrame, String> 
             SubAck::new(codes?).into()
         }
 
-        "pingresp" | "pong" => PingResp.into(),
+        "pingresp" | "pong" => Pong.into(),
 
         _ => return Err(format!("unknown command: {}", cmd)),
     };
