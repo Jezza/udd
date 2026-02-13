@@ -1,14 +1,13 @@
 use crate::{Args, utils};
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-    MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use crossterm::{event, execute};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Line, Span, Style, Stylize};
 use ratatui::widgets::{
     Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -18,7 +17,7 @@ use std::io;
 use std::io::{ErrorKind, stdout};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
 mod format;
@@ -45,7 +44,8 @@ struct LogEntry {
 }
 
 struct App {
-    socket: UdpSocket,
+    tx: Sender<NetCommand>,
+    rx: Receiver<NetEvent>,
     input: String,
     input_mode: InputMode,
     log: Vec<LogEntry>,
@@ -54,10 +54,139 @@ struct App {
     running: bool,
 }
 
+enum NetCommand {
+    Send { mode: InputMode, input: String },
+    Shutdown,
+}
+
+enum NetEvent {
+    Sent {
+        mode: InputMode,
+        data: Vec<u8>,
+        sent: usize,
+    },
+    Received(Vec<u8>),
+    Error(String),
+}
+
+fn parse_payload(mode: InputMode, input: &str) -> Result<Vec<u8>, String> {
+    match mode {
+        InputMode::Auto => {
+            if let Ok(frame) = parse::parse_mqtt_command(input) {
+                return Ok(frame.encode());
+            }
+            if let Ok(hex) = utils::parse_hex(input) {
+                return Ok(hex);
+            }
+            Ok(utils::parse_text_with_escapes(input))
+        }
+        InputMode::Text => Ok(utils::parse_text_with_escapes(input)),
+        InputMode::Hex => utils::parse_hex(input),
+        InputMode::Mqtt => parse::parse_mqtt_command(input).map(|frame| frame.encode()),
+    }
+}
+
+fn run_network_thread(
+    bind: String,
+    target: String,
+    rx_cmd: Receiver<NetCommand>,
+    tx_evt: Sender<NetEvent>,
+) {
+    let socket = match UdpSocket::bind(&bind) {
+        Ok(socket) => socket,
+        Err(err) => {
+            let _ = tx_evt.send(NetEvent::Error(format!("Bind failed: {}", err)));
+            return;
+        }
+    };
+
+    if let Err(err) = socket.connect(&target) {
+        let _ = tx_evt.send(NetEvent::Error(format!("Connect failed: {}", err)));
+        return;
+    }
+
+    if let Err(err) = socket.set_nonblocking(true) {
+        let _ = tx_evt.send(NetEvent::Error(format!(
+            "Failed to set nonblocking: {}",
+            err
+        )));
+        return;
+    }
+
+    let mut buffer = [0u8; 4096];
+    loop {
+        loop {
+            let (mode, data) = match rx_cmd.try_recv() {
+                Ok(NetCommand::Send { mode, input }) => match parse_payload(mode, &input) {
+                    Ok(data) => (mode, data),
+                    Err(err) => {
+                        if tx_evt.send(NetEvent::Error(err)).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                },
+                Ok(NetCommand::Shutdown) => return,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            };
+
+            match socket.send(&data) {
+                Ok(sent) => {
+                    if tx_evt.send(NetEvent::Sent { mode, data, sent }).is_err() {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    if tx_evt
+                        .send(NetEvent::Error(format!("Send failed: {}", err)))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            };
+        }
+
+        match socket.recv(&mut buffer) {
+            Ok(n) => {
+                if tx_evt
+                    .send(NetEvent::Received(buffer[..n].to_vec()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+            Err(err) if err.kind() == ErrorKind::ConnectionRefused => {
+                if tx_evt
+                    .send(NetEvent::Error(
+                        "ICMP: Connection refused (port unreachable)".to_string(),
+                    ))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(err) => {
+                if tx_evt
+                    .send(NetEvent::Error(format!("Receive failed: {}", err)))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 impl App {
-    fn new(socket: UdpSocket) -> io::Result<Self> {
-        Ok(Self {
-            socket,
+    fn new(tx: Sender<NetCommand>, rx: Receiver<NetEvent>) -> Self {
+        Self {
+            tx,
+            rx,
             input: String::new(),
             input_mode: InputMode::Auto,
             log: vec![LogEntry {
@@ -68,7 +197,7 @@ impl App {
             log_area: Rect::default(),
             scroll_offset: 0,
             running: true,
-        })
+        }
     }
 
     fn log_error(&mut self, msg: impl Into<String>) {
@@ -102,37 +231,14 @@ impl App {
 
         let mode = self.input_mode;
 
-        let data = match mode {
-            InputMode::Auto => match parse::parse_mqtt_command(&input).map(|f| f.encode()) {
-                Ok(value) => Ok(value),
-                Err(err) if mode == InputMode::Mqtt => Err(err),
-                Err(_err) => match utils::parse_hex(&input) {
-                    Ok(value) => Ok(value),
-                    Err(err) if mode == InputMode::Hex => Err(err),
-                    Err(_err) => Ok(utils::parse_text_with_escapes(&input)),
-                },
-            },
-            InputMode::Text => Ok(utils::parse_text_with_escapes(&input)),
-            InputMode::Hex => utils::parse_hex(&input),
-            InputMode::Mqtt => parse::parse_mqtt_command(&input).map(|frame| frame.encode()),
-        };
+        if let Err(err) = self.tx.send(NetCommand::Send { mode, input }) {
+            self.log_error(format!("Network thread unavailable: {}", err));
+            self.running = false;
+            return;
+        }
+    }
 
-        let data = match data {
-            Ok(data) => data,
-            Err(err) => {
-                self.log_error(err);
-                return;
-            }
-        };
-
-        let n = match self.socket.send(&data) {
-            Ok(n) => n,
-            Err(e) => {
-                self.log_error(format!("Send failed: {}", e));
-                return;
-            }
-        };
-
+    fn on_sent(&mut self, mode: InputMode, data: Vec<u8>, n: usize) {
         let mode_str = match mode {
             InputMode::Auto => "AUTO",
             InputMode::Text => "TXT",
@@ -149,6 +255,31 @@ impl App {
         );
     }
 
+    fn drain_net_events(&mut self) {
+        loop {
+            match self.rx.try_recv() {
+                Ok(NetEvent::Sent { mode, data, sent }) => self.on_sent(mode, data, sent),
+                Ok(NetEvent::Received(raw)) => {
+                    let display = format::format(&raw);
+                    self.log_msg(
+                        format!("← {} bytes: {}", raw.len(), display),
+                        Style::default().fg(Color::Green),
+                        Some((self.input_mode, raw)),
+                    );
+                }
+                Ok(NetEvent::Error(err)) => {
+                    self.log_msg(format!("✗ {}", err), Style::default().fg(Color::Red), None);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.log_error("Network thread disconnected");
+                    self.running = false;
+                    break;
+                }
+            }
+        }
+    }
+
     fn cycle_mode(&mut self) {
         self.input_mode = match self.input_mode {
             InputMode::Auto => InputMode::Mqtt,
@@ -157,37 +288,6 @@ impl App {
             InputMode::Hex => InputMode::Auto,
         };
     }
-
-    // fn drain_errors2(&mut self) {
-    //     let mut buf = [0u8; 1];
-    //     loop {
-    //         match self.socket.recv(&mut buf) {
-    //             Ok(_) => {
-    //                 self.log_msg(
-    //                     "← Received unexpected data".into(),
-    //                     Style::default().fg(Color::Yellow),
-    //                     None,
-    //                 );
-    //             }
-    //             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-    //             Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
-    //                 self.log_msg(
-    //                     "✗ ICMP: Connection refused (port unreachable)".into(),
-    //                     Style::default().fg(Color::Red),
-    //                     None,
-    //                 );
-    //             }
-    //             Err(e) => {
-    //                 self.log_msg(
-    //                     format!("✗ ICMP: {}", e),
-    //                     Style::default().fg(Color::Red),
-    //                     None,
-    //                 );
-    //                 break;
-    //             }
-    //         }
-    //     }
-    // }
 
     fn scroll(&mut self, delta: i16) {
         let visible = self.log_area.height.saturating_sub(2) as usize;
@@ -204,45 +304,14 @@ impl App {
 }
 
 pub fn run(args: &Args) -> io::Result<()> {
-    let socket = UdpSocket::bind(&args.bind)?;
-    socket.connect(&args.target)?;
-    socket.set_nonblocking(true)?;
+    let (tx_cmd, rx_cmd) = mpsc::channel::<NetCommand>();
+    let (tx_evt, rx_evt) = mpsc::channel::<NetEvent>();
+    let bind = args.bind.clone();
+    let target = args.target.clone();
+    let network_thread =
+        std::thread::spawn(move || run_network_thread(bind, target, rx_cmd, tx_evt));
 
-    let mut app = App::new(socket)?;
-
-    let logs = Arc::new(Mutex::new(vec![]));
-
-    if let Ok(socket) = app.socket.try_clone() {
-        std::thread::spawn({
-            let socket = socket;
-            let logs = logs.clone();
-
-            move || {
-                let mut buffer = [0u8; 4096];
-                loop {
-                    let n = match socket.recv(&mut buffer) {
-                        Ok(n) => n,
-                        Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(1000));
-                            continue;
-                        }
-                        Err(err) => {
-                            // app.log_error(format!("{}", err));
-                            continue;
-                        }
-                    };
-
-                    let buffer = &buffer[0..n];
-
-                    {
-                        let mut logs = logs.lock().unwrap();
-
-                        logs.push(buffer.to_vec());
-                    }
-                }
-            }
-        });
-    }
+    let mut app = App::new(tx_cmd, rx_evt);
 
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
@@ -251,19 +320,8 @@ pub fn run(args: &Args) -> io::Result<()> {
     let target = &args.target;
 
     while app.running {
+        app.drain_net_events();
         terminal.draw(|f| draw(f, &mut app, target))?;
-
-        {
-            let mut incoming = logs.lock().unwrap();
-            for raw in incoming.drain(..) {
-                let display = format::format(&raw);
-                app.log_msg(
-                    format!("← {} bytes: {}", raw.len(), display),
-                    Style::default().fg(Color::Green),
-                    Some((app.input_mode, raw)),
-                );
-            }
-        }
 
         if !event::poll(Duration::from_millis(100))? {
             continue;
@@ -288,6 +346,9 @@ pub fn run(args: &Args) -> io::Result<()> {
             _ => {}
         }
     }
+
+    let _ = app.tx.send(NetCommand::Shutdown);
+    let _ = network_thread.join();
 
     disable_raw_mode()?;
     execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
