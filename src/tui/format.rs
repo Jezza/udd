@@ -1,3 +1,4 @@
+use crate::InputMode;
 use mqtt::{Packet, UdpFrame};
 use std::borrow::Cow;
 
@@ -26,6 +27,39 @@ pub fn format(data: &[u8]) -> Cow<'_, str> {
         hex.trim().to_string()
     };
     Cow::Owned(t)
+}
+
+/// Format payload for display, honoring the selected input mode.
+pub fn format_for_mode(mode: InputMode, data: &[u8]) -> Cow<'_, str> {
+    match mode {
+        InputMode::Hex => Cow::Owned(format_hex(data)),
+        InputMode::Mqtt => Cow::Owned(format_mqtt_frame(data).unwrap_or_else(|| format_hex(data))),
+        InputMode::Text => format_text(data).unwrap_or_else(|| Cow::Owned(format_hex(data))),
+        InputMode::Auto => format(data),
+    }
+}
+
+fn format_hex(data: &[u8]) -> String {
+    let hex: String = data
+        .iter()
+        .take(24)
+        .map(|b| format!("{:02x} ", b))
+        .collect();
+    if data.len() > 24 {
+        format!("{}...", hex.trim())
+    } else {
+        hex.trim().to_string()
+    }
+}
+
+fn format_text(data: &[u8]) -> Option<Cow<'_, str>> {
+    str::from_utf8(data).ok().map(|s| {
+        if s.len() > 50 {
+            Cow::Owned(format!("{}...", &s[..47]))
+        } else {
+            Cow::Borrowed(s)
+        }
+    })
 }
 
 /// Decode and format MQTT frame for display

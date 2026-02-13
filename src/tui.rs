@@ -186,7 +186,7 @@ impl App {
             input: String::new(),
             input_mode: InputMode::Auto,
             log: vec![LogEntry {
-                display: "Ready. Tab=mode, Enter=send, Esc=quit, Click=replay".into(),
+                display: "Ready. Tab=mode, Enter=send, Esc=quit".into(),
                 style: Style::default().dim(),
                 payload: None,
             }],
@@ -211,7 +211,7 @@ impl App {
             style,
             payload,
         });
-        // Auto-scroll to bottom
+
         let visible = self.log_area.height.saturating_sub(2) as usize;
         if self.log.len() > visible {
             self.scroll_offset = self.log.len() - visible;
@@ -235,7 +235,7 @@ impl App {
     }
 
     fn on_sent(&mut self, mode: InputMode, data: Vec<u8>, n: usize) {
-        let display = format::format(&data);
+        let display = format::format_for_mode(mode, &data);
 
         self.log_msg(
             format!("→ [{}] {} bytes: {}", mode.short_label(), n, display),
@@ -249,11 +249,12 @@ impl App {
             match self.rx.try_recv() {
                 Ok(NetEvent::Sent { mode, data, sent }) => self.on_sent(mode, data, sent),
                 Ok(NetEvent::Received(raw)) => {
-                    let display = format::format(&raw);
+                    let mode = self.input_mode;
+                    let display = format::format_for_mode(mode, &raw);
                     self.log_msg(
                         format!("← {} bytes: {}", raw.len(), display),
                         Style::default().fg(Color::Green),
-                        Some((self.input_mode, raw)),
+                        Some((mode, raw)),
                     );
                 }
                 Ok(NetEvent::Error(err)) => {
@@ -271,10 +272,10 @@ impl App {
 
     fn cycle_mode(&mut self) {
         self.input_mode = match self.input_mode {
-            InputMode::Auto => InputMode::Mqtt,
-            InputMode::Mqtt => InputMode::Text,
+            InputMode::Auto => InputMode::Text,
             InputMode::Text => InputMode::Hex,
-            InputMode::Hex => InputMode::Auto,
+            InputMode::Hex => InputMode::Mqtt,
+            InputMode::Mqtt => InputMode::Auto,
         };
     }
 
