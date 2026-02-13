@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
+use crate::InputMode;
+
 mod format;
 mod parse;
 
@@ -27,14 +29,6 @@ static MSG_ID_COUNTER: AtomicU16 = AtomicU16::new(1);
 
 fn next_msg_id() -> u16 {
     MSG_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum InputMode {
-    Auto,
-    Text,
-    Hex,
-    Mqtt,
 }
 
 struct LogEntry {
@@ -69,20 +63,22 @@ enum NetEvent {
     Error(String),
 }
 
-fn parse_payload(mode: InputMode, input: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn parse_payload(mode: InputMode, input: &str) -> Result<(InputMode, Vec<u8>), String> {
     match mode {
         InputMode::Auto => {
             if let Ok(frame) = parse::parse_mqtt_command(input) {
-                return Ok(frame.encode());
+                return Ok((InputMode::Mqtt, frame.encode()));
             }
             if let Ok(hex) = utils::parse_hex(input) {
-                return Ok(hex);
+                return Ok((InputMode::Hex, hex));
             }
-            Ok(utils::parse_text_with_escapes(input))
+            Ok((InputMode::Text, utils::parse_text_with_escapes(input)))
         }
-        InputMode::Text => Ok(utils::parse_text_with_escapes(input)),
-        InputMode::Hex => utils::parse_hex(input),
-        InputMode::Mqtt => parse::parse_mqtt_command(input).map(|frame| frame.encode()),
+        InputMode::Mqtt => {
+            parse::parse_mqtt_command(input).map(|frame| (InputMode::Mqtt, frame.encode()))
+        }
+        InputMode::Hex => utils::parse_hex(input).map(|hex| (InputMode::Hex, hex)),
+        InputMode::Text => Ok((InputMode::Text, utils::parse_text_with_escapes(input))),
     }
 }
 
@@ -118,7 +114,7 @@ fn run_network_thread(
         loop {
             let (mode, data) = match rx_cmd.try_recv() {
                 Ok(NetCommand::Send { mode, input }) => match parse_payload(mode, &input) {
-                    Ok(data) => (mode, data),
+                    Ok(data) => data,
                     Err(err) => {
                         if tx_evt.send(NetEvent::Error(err)).is_err() {
                             return;
@@ -239,17 +235,10 @@ impl App {
     }
 
     fn on_sent(&mut self, mode: InputMode, data: Vec<u8>, n: usize) {
-        let mode_str = match mode {
-            InputMode::Auto => "AUTO",
-            InputMode::Text => "TXT",
-            InputMode::Hex => "HEX",
-            InputMode::Mqtt => "MQTT",
-        };
-
         let display = format::format(&data);
 
         self.log_msg(
-            format!("→ [{}] {} bytes: {}", mode_str, n, display),
+            format!("→ [{}] {} bytes: {}", mode.short_label(), n, display),
             Style::default().fg(Color::Cyan),
             Some((mode, data)),
         );
